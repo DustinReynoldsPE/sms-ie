@@ -60,6 +60,9 @@ data class MessageTotal(var sms: Int = 0, var mms: Int = 0)
 
 data class MmsBinaryPart(val uri: Uri, val filename: String)
 
+// Name of the marker entry written into incremental export archives.
+const val EXPORT_METADATA_ENTRY = "export-metadata.json"
+
 suspend fun exportMessages(
     appContext: Context, outputStream: OutputStream?, updateProgress: suspend (Progress) -> Unit,
     dateRangeMs: Pair<Long, Long>? = null
@@ -72,6 +75,21 @@ suspend fun exportMessages(
         // https://bugs.openjdk.org/browse/JDK-8054565
         // https://stackoverflow.com/questions/25175882/java-8-filteroutputstream-exception
         ZipOutputStream(outputStream).use { zipOutputStream ->
+            // Delta archives carry a marker so importers know their overlap
+            // window deliberately re-exports already-covered messages and can
+            // deduplicate them automatically. It is written first so a
+            // streaming reader sees it before messages.ndjson.
+            dateRangeMs?.let { (sinceMs, untilMs) ->
+                zipOutputStream.putNextEntry(ZipEntry(EXPORT_METADATA_ENTRY))
+                zipOutputStream.write(
+                    JSONObject()
+                        .put("incremental", true)
+                        .put("since_ms", sinceMs)
+                        .put("until_ms", untilMs)
+                        .toString().toByteArray()
+                )
+                zipOutputStream.closeEntry()
+            }
             val jsonZipEntry = ZipEntry("messages.ndjson")
             zipOutputStream.putNextEntry(jsonZipEntry)
             if (prefs.getBoolean("sms", true)) {
@@ -334,7 +352,7 @@ suspend fun importMessages(
 ): MessageTotal {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     var progress = Progress(0, 0, null)
-    val deduplication = prefs.getBoolean("deduplication", false)
+    var deduplication = prefs.getBoolean("deduplication", false)
     val importSubIds = prefs.getBoolean("import_sub_ids", false)
     return withContext(Dispatchers.IO) {
         val totals = MessageTotal()
@@ -401,6 +419,18 @@ suspend fun importMessages(
         ZipInputStream(inputStream).use { zipInputStream ->
             var zipEntry = zipInputStream.nextEntry
             while (zipEntry != null) {
+                // Delta archives mark themselves so overlap re-exports cannot
+                // duplicate rows on restore, regardless of the dedup pref.
+                if (zipEntry.name == EXPORT_METADATA_ENTRY) {
+                    try {
+                        if (JSONObject(
+                                zipInputStream.readBytes().decodeToString()
+                            ).optBoolean("incremental")
+                        ) deduplication = true
+                    } catch (e: Exception) {
+                        Log.w(LOG_TAG, "Ignoring malformed $EXPORT_METADATA_ENTRY", e)
+                    }
+                }
                 if (zipEntry.name == "messages.ndjson") break
                 zipEntry = zipInputStream.nextEntry
             }

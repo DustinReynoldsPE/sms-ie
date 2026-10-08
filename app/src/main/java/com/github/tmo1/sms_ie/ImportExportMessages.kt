@@ -61,7 +61,8 @@ data class MessageTotal(var sms: Int = 0, var mms: Int = 0)
 data class MmsBinaryPart(val uri: Uri, val filename: String)
 
 suspend fun exportMessages(
-    appContext: Context, outputStream: OutputStream?, updateProgress: suspend (Progress) -> Unit
+    appContext: Context, outputStream: OutputStream?, updateProgress: suspend (Progress) -> Unit,
+    dateRangeMs: Pair<Long, Long>? = null
 ): MessageTotal {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     return withContext(Dispatchers.IO) {
@@ -75,7 +76,7 @@ suspend fun exportMessages(
             zipOutputStream.putNextEntry(jsonZipEntry)
             if (prefs.getBoolean("sms", true)) {
                 totals.sms = smsToJSON(
-                    appContext, zipOutputStream, displayNames, updateProgress
+                    appContext, zipOutputStream, displayNames, updateProgress, dateRangeMs
                 )
             }
             val mmsPartList = mutableListOf<MmsBinaryPart>()
@@ -86,6 +87,7 @@ suspend fun exportMessages(
                     displayNames,
                     mmsPartList,
                     updateProgress,
+                    dateRangeMs,
                 )
             }
             zipOutputStream.closeEntry()
@@ -130,11 +132,12 @@ private suspend fun smsToJSON(
     zipOutputStream: ZipOutputStream,
     displayNames: MutableMap<String, String?>,
     updateProgress: suspend (Progress) -> Unit,
+    dateRangeMs: Pair<Long, Long>? = null,
 ): Int {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     var progress = Progress(0, 0, null)
     val smsCursor = appContext.contentResolver.query(
-        Telephony.Sms.CONTENT_URI, null, messageSelection(appContext, SMS), null, null
+        Telephony.Sms.CONTENT_URI, null, messageSelection(appContext, SMS, dateRangeMs), null, null
     )
     smsCursor?.use {
         if (it.moveToFirst()) {
@@ -178,12 +181,13 @@ private suspend fun mmsToJSON(
     displayNames: MutableMap<String, String?>,
     mmsPartList: MutableList<MmsBinaryPart>,
     updateProgress: suspend (Progress) -> Unit,
+    dateRangeMs: Pair<Long, Long>? = null,
 ): Int {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     val includeBlobs = prefs.getBoolean("include_blobs", true)
     var progress = Progress(0, 0, null)
     val mmsCursor = appContext.contentResolver.query(
-        Telephony.Mms.CONTENT_URI, null, messageSelection(appContext, MMS), null, null
+        Telephony.Mms.CONTENT_URI, null, messageSelection(appContext, MMS, dateRangeMs), null, null
     )
     mmsCursor?.use {
         if (it.moveToFirst()) {

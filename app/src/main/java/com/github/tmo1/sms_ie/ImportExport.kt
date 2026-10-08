@@ -207,12 +207,24 @@ suspend fun automaticExport(
 
     if (prefs.getBoolean("export_messages", true)) {
         try {
+            // In incremental mode each scheduled export covers only messages
+            // newer than the previous successful one. The watermark is the
+            // run's start time, and it advances only after the archive has
+            // been written completely, so a failed run never skips a range.
+            val incremental = prefs.getBoolean("incremental_export", false)
+            val dateRangeMs = if (incremental) Pair(
+                prefs.getLong("incremental_watermark_ms", 0L), System.currentTimeMillis()
+            ) else null
             val file = createFile(
                 documentTree, "application/zip", "messages$dateInString.zip", passphrase != null
             )
             messages = exportMessages(
-                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress
+                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress,
+                dateRangeMs
             )
+            if (incremental) prefs.edit().putLong(
+                "incremental_watermark_ms", dateRangeMs!!.second
+            ).apply()
             deleteOldExports(prefs, documentTree, file, "messages")
         } catch (e: Exception) {
             firstException = e

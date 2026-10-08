@@ -125,6 +125,13 @@
             android:title="Export contacts"
             app:dependency="schedule_export" />
 
+        <SwitchPreferenceCompat
+            android:defaultValue="false"
+            android:key="incremental_export"
+            android:summary="Each scheduled export contains only messages newer than the previous successful export."
+            android:title="Incremental message export"
+            app:dependency="schedule_export" />
+
         <!--<SwitchPreferenceCompat
             android:defaultValue="true"
             android:key="export_blocked_numbers"

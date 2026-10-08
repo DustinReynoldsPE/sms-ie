@@ -93,9 +93,10 @@ private fun countZipEntries(fd: FileDescriptor, fileSize: Long): Int? {
 // Re-open a freshly written archive and verify it. The entry count comes from
 // the EOCD record (cheap tail read; a truncated file fails). The NDJSON entry
 // is then read back in full through ZipInputStream, which throws if its CRC-32
-// does not match - and since messages.ndjson is always the first entry
-// written, the read stops there instead of streaming gigabytes of binary
-// parts, which receive structural verification only.
+// does not match. Entries before it are skipped; since messages.ndjson is
+// written at the head of the archive, the read stops there instead of
+// streaming gigabytes of binary parts, which receive structural
+// verification only.
 fun verifyExportZip(appContext: Context, uri: Uri): ExportVerification {
     appContext.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
         val bytes = Os.fstat(descriptor.fileDescriptor).st_size
@@ -104,9 +105,12 @@ fun verifyExportZip(appContext: Context, uri: Uri): ExportVerification {
             ?: throw IOException("Could not re-open export archive for verification")
         input.use { stream ->
             val zip = ZipInputStream(stream)
-            val entry = zip.nextEntry
+            var entry = zip.nextEntry
                 ?: throw IOException("Verification failed: export archive has no entries")
-            if (entry.name != "messages.ndjson") throw IOException("Verification failed: first export archive entry is ${entry.name}")
+            while (entry.name != "messages.ndjson") {
+                entry = zip.nextEntry
+                    ?: throw IOException("Verification failed: export archive has no messages.ndjson entry")
+            }
             val buffer = ByteArray(65536)
             while (zip.read(buffer) >= 0) {
                 // Drain the entry; ZipInputStream validates the CRC-32 as the

@@ -29,6 +29,7 @@ package com.github.tmo1.sms_ie
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -297,6 +298,18 @@ fun deleteOldExports(
         }
         Log.i(LOG_TAG, "$total exports deleted")
     }
+}
+
+// Resolve the display label of a package that can act as a messaging app.
+// Returns null if the package is no longer installed or no longer qualifies.
+// Package visibility rules require the CATEGORY_APP_MESSAGING <queries>
+// declaration in the manifest for this lookup to succeed.
+fun smsAppLabel(appContext: Context, packageName: String): String? {
+    val intent = Intent(Intent.ACTION_MAIN)
+        .addCategory(Intent.CATEGORY_APP_MESSAGING)
+    return appContext.packageManager.queryIntentActivities(intent, 0)
+        .firstOrNull { it.activityInfo.packageName == packageName }
+        ?.loadLabel(appContext.packageManager)?.toString()
 }
 
 fun comparePhoneNumbers(number1: String, number2: String): Boolean {

@@ -31,6 +31,7 @@ import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Build.VERSION.SDK_INT
@@ -56,6 +57,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.view.updateLayoutParams
 import androidx.core.view.updatePadding
 import androidx.fragment.app.DialogFragment
@@ -79,6 +81,18 @@ const val CHANNEL_ID_PERSISTENT = "PERSISTENT"
 const val CHANNEL_ID_ALERTS = "ALERTS"
 const val NOTIFICATION_ID_PERSISTENT = 0
 const val NOTIFICATION_ID_ALERT = 1
+const val NOTIFICATION_ID_SMS_ROLE = 2
+
+// The package that held the default SMS app role before we requested it, so
+// that it can be offered back when the operation completes.
+const val PREVIOUS_SMS_PACKAGE = "previous_sms_package"
+
+private const val STATE_PRE_ROLE_SMS_PACKAGE = "pre_role_sms_package"
+
+// True while MainActivity is started (visible). ImportExportWorker reads this
+// to decide between the in-app role-restore dialog and a notification.
+@Volatile
+internal var mainActivityStarted = false
 
 const val ENCRYPTED_FILE_EXTENSION = "ssef"
 
@@ -132,6 +146,15 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
     private val requestSmsRole =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             launchPostSmsRoleAction(result.resultCode == RESULT_OK)
+            // Persist the previous holder only if the role was actually
+            // granted - on cancel there is nothing to restore.
+            if (result.resultCode == RESULT_OK) {
+                preRoleSmsPackage?.let {
+                    if (it != packageName) prefs.edit()
+                        .putString(PREVIOUS_SMS_PACKAGE, it).apply()
+                }
+            }
+            preRoleSmsPackage = null
         }
 
     // The following variables are all saved across Activity recreation in onSavedInstanceState.
@@ -140,6 +163,10 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
 
     // Action to perform after the SMS role has been acquired.
     private var postSmsRoleAction: PostSmsRoleAction? = null
+
+    // The package that held the default SMS app role before we requested it;
+    // persisted as PREVIOUS_SMS_PACKAGE only if the role request succeeds.
+    private var preRoleSmsPackage: String? = null
 
     // User supplied passphrase
     private var passphrase: String? = null
@@ -200,6 +227,8 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
             if (postSmsRoleActionIndex != -1) {
                 postSmsRoleAction = PostSmsRoleAction.entries.toTypedArray()[postSmsRoleActionIndex]
             }
+
+            preRoleSmsPackage = savedInstanceState.getString(STATE_PRE_ROLE_SMS_PACKAGE)
         }
 
         // get necessary permissions on startup
@@ -389,6 +418,11 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
                 // we've already observed.
                 if (workInfo.state.isFinished) {
                     workManager.pruneWork()
+                    // Manual operations that acquired the default SMS app role
+                    // should offer to return it once they finish.
+                    if (workInfo.tags.contains(ImportExportWorker.TAG_MANUAL_ACTION)) {
+                        maybeRestoreSmsRole()
+                    }
                 }
             }
 
@@ -412,6 +446,16 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
                 setDefaultSMSAppButton
             ).forEach { button -> button.isEnabled = !isRunning }
         })
+    }
+
+    override fun onStart() {
+        super.onStart()
+        mainActivityStarted = true
+    }
+
+    override fun onStop() {
+        mainActivityStarted = false
+        super.onStop()
     }
 
     override fun onResume() {
@@ -456,6 +500,9 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
         }
         postSmsRoleAction?.let {
             outState.putInt(STATE_POST_SMS_ROLE_ACTION, it.ordinal)
+        }
+        preRoleSmsPackage?.let {
+            outState.putString(STATE_PRE_ROLE_SMS_PACKAGE, it)
         }
         uri?.let {
             outState.putString(URI_STRING, it.toString())
@@ -633,6 +680,13 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
     }
 
     override fun onDefaultSMSAppDialogPositiveClick(dialog: DialogFragment) {
+        // Capture the current default SMS app so that the role can be offered
+        // back to it when the operation completes. We don't hold the role at
+        // this point - this dialog is only shown when we don't - so the
+        // current holder is the user's normal SMS app. Recorded in a field
+        // rather than the preference so that a canceled role request leaves
+        // nothing to restore; the activity result callback persists it.
+        preRoleSmsPackage = Telephony.Sms.getDefaultSmsPackage(this)
         val intent =
             if (SDK_INT >= Build.VERSION_CODES.Q) getSystemService(RoleManager::class.java).createRequestRoleIntent(
                 RoleManager.ROLE_SMS
@@ -641,6 +695,42 @@ class MainActivity : AppCompatActivity(), ConfirmWipeFragment.NoticeDialogListen
                 putExtra(Telephony.Sms.Intents.EXTRA_PACKAGE_NAME, packageName)
             }
         requestSmsRole.launch(intent)
+    }
+
+    // Offer to return the default SMS app role to the previous holder after an
+    // operation that required it. Android allows no programmatic handoff -
+    // RoleManager requests are self-only, and ACTION_CHANGE_DEFAULT naming
+    // another package is stripped by PermissionPolicyService on modern
+    // versions - so this asks the user and deep-links to the system's default
+    // apps settings, where switching back is two taps. The prompt fires once
+    // per role acquisition: the recorded package is cleared when the dialog is
+    // shown, so a user who keeps us as the default is not asked again.
+    private fun maybeRestoreSmsRole() {
+        val previous = prefs.getString(PREVIOUS_SMS_PACKAGE, null) ?: return
+        val weHoldRole = if (SDK_INT >= Build.VERSION_CODES.Q) {
+            getSystemService(RoleManager::class.java).isRoleHeld(RoleManager.ROLE_SMS)
+        } else {
+            Telephony.Sms.getDefaultSmsPackage(this) == packageName
+        }
+        if (!weHoldRole) return
+        // The previous app may have been uninstalled meanwhile; there is
+        // nothing to restore to then.
+        val previousLabel = smsAppLabel(this, previous) ?: run {
+            prefs.edit().remove(PREVIOUS_SMS_PACKAGE).apply()
+            return
+        }
+        prefs.edit().remove(PREVIOUS_SMS_PACKAGE).apply()
+        // The worker may have posted a restore notification for the case where
+        // this activity wasn't in the foreground; the in-app dialog supersedes
+        // it.
+        NotificationManagerCompat.from(this).cancel(NOTIFICATION_ID_SMS_ROLE)
+        AlertDialog.Builder(this)
+            .setMessage(getString(R.string.restore_sms_app_message, previousLabel))
+            .setPositiveButton(R.string.restore_sms_app_open_settings) { _, _ ->
+                startActivity(Intent(ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     private fun setStatusReport(statusReport: String) {

@@ -30,11 +30,15 @@ import android.app.BackgroundServiceStartNotAllowedException
 import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.PendingIntent
+import android.app.role.RoleManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
+import android.provider.Telephony
 import android.text.format.DateUtils.formatElapsedTime
 import android.util.Log
 import androidx.core.app.ActivityCompat
@@ -259,7 +263,10 @@ class ImportExportWorker(appContext: Context, workerParams: WorkerParameters) :
         // Don't show completion notifications for canceled jobs since cancellations are always
         // initiated by the user. There's no need to annoy them with a cancellation exception error
         // message.
-        if (!isStopped) notifyResult(result, action)
+        if (!isStopped) {
+            notifyResult(result, action)
+            maybeNotifySmsRoleRestore()
+        }
         Log.i(LOG_TAG, "$action result: $result")
         // This log message also serves as an indicator to know that the logs are complete. See the
         // note about the -f option above.
@@ -616,6 +623,62 @@ class ImportExportWorker(appContext: Context, workerParams: WorkerParameters) :
                 // notificationId is a unique int for each notification that you must define
                 .notify(NOTIFICATION_ID_ALERT, builder.build())
         }
+    }
+
+    // Operations that required the default SMS app role leave us holding it
+    // when they finish, which breaks SMS delivery in the user's normal app.
+    // There is no programmatic role handoff, so if we still hold the role and
+    // a previous holder was recorded, post a notification whose action launches
+    // the system dialog to make that app the default again. When MainActivity
+    // is in the foreground it pops the dialog itself instead and cancels this
+    // notification.
+    private fun maybeNotifySmsRoleRestore() {
+        if (action !in listOf(
+                Action.IMPORT_MESSAGES_MANUAL, Action.WIPE_MESSAGES_MANUAL,
+                Action.IMPORT_BLOCKED_NUMBERS_MANUAL, Action.EXPORT_BLOCKED_NUMBERS_MANUAL
+            )
+        ) return
+        // When the activity is visible its observer shows the restore dialog
+        // itself (and cancels this notification), so there is nothing to post.
+        if (mainActivityStarted) return
+        val previous = prefs.getString(PREVIOUS_SMS_PACKAGE, null) ?: return
+        val context = applicationContext
+        val weHoldRole = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            context.getSystemService(RoleManager::class.java)
+                .isRoleHeld(RoleManager.ROLE_SMS)
+        } else {
+            Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
+        }
+        if (!weHoldRole) return
+        // The previous app may have been uninstalled meanwhile; there is
+        // nothing to restore to then.
+        val previousLabel = smsAppLabel(context, previous) ?: run {
+            prefs.edit().remove(PREVIOUS_SMS_PACKAGE).apply()
+            return
+        }
+        val havePermissions = ActivityCompat.checkSelfPermission(
+            context, Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!havePermissions) return
+        // A third-party package cannot be granted the role programmatically
+        // and ACTION_CHANGE_DEFAULT naming another package is stripped on
+        // modern Android, so the notification deep-links to the system's
+        // default apps settings, where switching back is two taps.
+        val intent = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+        val pendingIntent = PendingIntent.getActivity(
+            context, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID_ALERTS)
+            .setSmallIcon(R.drawable.ic_scheduled_export_done)
+            .setContentTitle(context.getString(R.string.restore_sms_app_title))
+            .setContentText(
+                context.getString(R.string.restore_sms_app_message, previousLabel)
+            )
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+        notificationManager.notify(NOTIFICATION_ID_SMS_ROLE, builder.build())
     }
 }
 

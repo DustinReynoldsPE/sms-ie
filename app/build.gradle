@@ -58,6 +58,7 @@ android {
             minSdkVersion 24
             versionCode 10000 + android.defaultConfig.versionCode
             versionNameSuffix "-standard"
+            applicationIdSuffix ".perf"
             getIsDefault().set(true)
         }
         legacy {

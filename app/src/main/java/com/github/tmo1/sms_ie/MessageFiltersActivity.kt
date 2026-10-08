@@ -270,17 +270,23 @@ fun messageSelection(
     } else null
     // Incremental scheduled exports pass a date range so that each run covers
     // only new messages. The 'date' column holds milliseconds for SMS and
-    // seconds for MMS; overlapping bounds (>= since, <= until) are deliberate —
-    // re-import deduplication absorbs the double-covered boundary message.
+    // seconds for MMS. The SMS lower bound is exclusive: the stored watermark
+    // was already covered by the previous run. The MMS lower bound stays
+    // inclusive after flooring to seconds because messages sharing that
+    // boundary second cannot be distinguished; a boundary-second MMS is
+    // re-exported, which the optional import deduplication absorbs. The
+    // upper bound rounds up so an MMS arriving in the partial final second
+    // is not skipped while the watermark advances past it.
     val clauses = mutableListOf<String>()
     if (filterSelection != null) clauses.add(filterSelection)
     dateRangeMs?.let { (sinceMs, untilMs) ->
-        val since = if (messageType == MMS) sinceMs / 1000 else sinceMs
-        // The upper bound rounds up so an MMS arriving in the partial final
-        // second is not skipped while the watermark advances past it.
-        val until = if (messageType == MMS) (untilMs + 999) / 1000 else untilMs
-        clauses.add("date >= $since")
-        clauses.add("date <= $until")
+        if (messageType == MMS) {
+            clauses.add("date >= ${sinceMs / 1000}")
+            clauses.add("date <= ${(untilMs + 999) / 1000}")
+        } else {
+            clauses.add("date > $sinceMs")
+            clauses.add("date <= $untilMs")
+        }
     }
     val selection = clauses.joinToString(" AND ").takeIf { it.isNotEmpty() }
     Log.d(LOG_TAG, "${if (messageType == SMS) "SMS" else "MMS"} selection: $selection")

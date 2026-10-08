@@ -45,10 +45,13 @@ import androidx.work.Data
 import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
+import java.security.DigestOutputStream
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Locale
 
@@ -204,15 +207,36 @@ suspend fun automaticExport(
 
     // We want to back up as much as possible, so avoid failing fast.
     var firstException: Exception? = null
+    // Successful, verified exports are described in a JSON manifest written
+    // alongside them (see ExportManifest.kt). The manifest is the backup run's
+    // machine-readable receipt: a consumer can confirm an archive's integrity
+    // via its SHA-256 without opening it.
+    val manifestExports = JSONObject()
 
     if (prefs.getBoolean("export_messages", true)) {
         try {
             val file = createFile(
                 documentTree, "application/zip", "messages$dateInString.zip", passphrase != null
             )
+            val digest = MessageDigest.getInstance("SHA-256")
             messages = exportMessages(
-                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress
+                appContext, getOutputStream(appContext, file.uri, passphrase, digest), updateProgress
             )
+            // An encrypted archive is ciphertext, so its zip structure cannot
+            // be verified here; the manifest records the ciphertext hash.
+            val verification =
+                if (passphrase == null) verifyExportZip(appContext, file.uri)
+                else ExportVerification(exportedFileSize(appContext, file.uri))
+            manifestExports.put("messages", JSONObject()
+                .put("file", file.name)
+                .put("bytes", verification.bytes)
+                .put("sha256", digest.digest().toHexString())
+                .put("encrypted", passphrase != null)
+                .put("entries", verification.zipEntries)
+                .put("verified", verification.ndjsonVerified)
+                .put("records", JSONObject()
+                    .put("sms", messages.sms)
+                    .put("mms", messages.mms)))
             deleteOldExports(prefs, documentTree, file, "messages")
         } catch (e: Exception) {
             firstException = e
@@ -224,9 +248,16 @@ suspend fun automaticExport(
             val file = createFile(
                 documentTree, "application/json", "calls$dateInString.json", passphrase != null
             )
+            val digest = MessageDigest.getInstance("SHA-256")
             calls = exportCallLog(
-                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress
+                appContext, getOutputStream(appContext, file.uri, passphrase, digest), updateProgress
             )
+            manifestExports.put("calls", JSONObject()
+                .put("file", file.name)
+                .put("bytes", exportedFileSize(appContext, file.uri))
+                .put("sha256", digest.digest().toHexString())
+                .put("encrypted", passphrase != null)
+                .put("records", calls))
             deleteOldExports(prefs, documentTree, file, "calls")
         } catch (e: Exception) {
             firstException = firstException ?: e
@@ -238,9 +269,16 @@ suspend fun automaticExport(
             val file = createFile(
                 documentTree, "application/json", "contacts$dateInString.json", passphrase != null
             )
+            val digest = MessageDigest.getInstance("SHA-256")
             contacts = exportContacts(
-                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress
+                appContext, getOutputStream(appContext, file.uri, passphrase, digest), updateProgress
             )
+            manifestExports.put("contacts", JSONObject()
+                .put("file", file.name)
+                .put("bytes", exportedFileSize(appContext, file.uri))
+                .put("sha256", digest.digest().toHexString())
+                .put("encrypted", passphrase != null)
+                .put("records", contacts))
             deleteOldExports(prefs, documentTree, file, "contacts")
         } catch (e: Exception) {
             firstException = firstException ?: e
@@ -263,6 +301,18 @@ suspend fun automaticExport(
             firstException = firstException ?: e
         }
     }*/
+
+    // Only exports that completed and verified appear in the manifest; a
+    // failed type is simply absent from it, and its exception is still
+    // propagated below.
+    if (manifestExports.length() > 0) {
+        try {
+            val manifestFile = writeExportManifest(appContext, documentTree, date, manifestExports)
+            deleteOldExports(prefs, documentTree, manifestFile, "manifest")
+        } catch (e: Exception) {
+            firstException = firstException ?: e
+        }
+    }
 
     if (firstException != null) throw firstException
 
@@ -337,8 +387,14 @@ const val M_COST_IN_KIBIBYTES = 65536
 const val SALT_LENGTH = 16
 
 const val INTEGER_LENGTH = Int.SIZE_BYTES
-fun getOutputStream(appContext: Context, uri: Uri, passphrase: String?): OutputStream? {
-    val outputStream = appContext.contentResolver.openOutputStream(uri, "wt") ?: return null
+fun getOutputStream(
+    appContext: Context, uri: Uri, passphrase: String?, digest: MessageDigest? = null
+): OutputStream? {
+    val rawStream = appContext.contentResolver.openOutputStream(uri, "wt") ?: return null
+    // When a digest is supplied it covers the raw file bytes, so for encrypted
+    // exports the resulting hash is of the ciphertext - which is what a
+    // consumer of the manifest needs to verify the file on disk.
+    val outputStream = if (digest != null) DigestOutputStream(rawStream, digest) else rawStream
     return if (passphrase == null) outputStream else {
         if (SDK_INT < 23) throw RuntimeException("Encryption requires API >= 23")
         val salt = ByteArray(SALT_LENGTH)

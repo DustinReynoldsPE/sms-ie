@@ -302,15 +302,26 @@ fun deleteOldExports(
         var total = 0
         val extension = if (prefix == "messages") "zip" else "json"
         val encryptedFileExtension = "$extension.${ENCRYPTED_FILE_EXTENSION}"
-        files.forEach {
+        // Keep the N newest matching files in addition to the export just
+        // written. Ordering: the yyyy-MM-dd datestamp sorts chronologically;
+        // same-day collisions carry an Android-assigned " (n)" suffix which we
+        // split off and compare numerically (plain file = 0, oldest). Files
+        // are sorted ascending so the newest sit at the tail. lastModified()
+        // is unreliable on SAF providers, so it is not used.
+        val suffixRegex = Regex(""" \((\d+)\)""")
+        val keepOld = (prefs.getInt("exports_to_keep", 1) - 1).coerceAtLeast(0)
+        val deletable = files.filter {
             val name = it.name
-            if (name != null && name != newFilename && name.startsWith(prefix) && (name.endsWith(".$extension") || (name.endsWith(
+            name != null && name != newFilename && name.startsWith(prefix) && (name.endsWith(".$extension") || (name.endsWith(
                     ".${encryptedFileExtension}"
                 )))
-            ) {
-                it.delete()
-                total++
-            }
+        }.sortedWith(
+            compareBy<DocumentFile> { it.name!!.replace(suffixRegex, "") }
+                .thenBy { suffixRegex.find(it.name!!)?.groupValues?.get(1)?.toIntOrNull() ?: 0 }
+        ).dropLast(keepOld)
+        deletable.forEach {
+            it.delete()
+            total++
         }
         if (prefs.getBoolean("remove_datestamps_from_filenames", false)) {
             newExport?.renameTo("$prefix.$extension")

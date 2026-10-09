@@ -100,6 +100,15 @@
             android:title="Delete old exports"
             app:dependency="schedule_export" />
 
+        <SeekBarPreference
+            android:defaultValue="1"
+            android:key="exports_to_keep"
+            android:max="30"
+            android:min="1"
+            android:title="Number of exports to keep"
+            app:dependency="delete_old_exports"
+            app:showSeekBarValue="true" />
+
         <SwitchPreferenceCompat
             android:defaultValue="false"
             android:key="remove_datestamps_from_filenames"

@@ -81,6 +81,9 @@
     <string name="alerts_channel_description">Success/failure alerts when scheduled exports complete</string>
     <string name="scheduled_export_executing">Scheduled export executing</string>
     <string name="scheduled_export_executed">Scheduled export executed</string>
+    <string name="restore_sms_app_title">SMS app role still held</string>
+    <string name="restore_sms_app_open_settings">Change default SMS app</string>
+    <string name="restore_sms_app_message">SMS Import / Export is still the default SMS app. Tap to open default apps settings and switch back to %1$s.</string>
     <string name="scheduled_export_success">%1$d SMS(s), %2$d MMS(s), %3$d calls, and %4$d contacts exported.</string>
     <string name="wipe_messages">Wipe Messages</string>
     <string name="dialog_confirm_wipe">Warning: Wipe all messages (subject to message filtering, if enabled) from this device permanently, without being able to undo it\?</string>

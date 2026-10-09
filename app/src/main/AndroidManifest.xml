@@ -112,4 +112,13 @@
         </activity>
     </application>
 
+    <!-- Needed to resolve the label of the previous default SMS app for the
+         role-restore prompt; package visibility rules otherwise hide it. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.APP_MESSAGING" />
+        </intent>
+    </queries>
+
 </manifest>

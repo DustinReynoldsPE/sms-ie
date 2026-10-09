@@ -143,8 +143,12 @@ private fun mmsAddrToJSON(
     return mmsAddr
 }
 
+// Name of the marker entry written into incremental export archives.
+const val EXPORT_METADATA_ENTRY = "export-metadata.json"
+
 suspend fun exportMessages(
-    appContext: Context, outputStream: OutputStream?, updateProgress: suspend (Progress) -> Unit
+    appContext: Context, outputStream: OutputStream?, updateProgress: suspend (Progress) -> Unit,
+    dateRangeMs: Pair<Long, Long>? = null
 ): MessageTotal {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     return withContext(Dispatchers.IO) {
@@ -158,11 +162,26 @@ suspend fun exportMessages(
         // the BufferedOutputStream coalesces the small per-message JSON writes
         // into larger writes to the (often slow) SAF-provided file descriptor
         ZipOutputStream(BufferedOutputStream(outputStream)).use { zipOutputStream ->
+            // Delta archives carry a marker so importers know their overlap
+            // window deliberately re-exports already-covered messages and can
+            // deduplicate them automatically. It is written first so a
+            // streaming reader sees it before messages.ndjson.
+            dateRangeMs?.let { (sinceMs, untilMs) ->
+                zipOutputStream.putNextEntry(ZipEntry(EXPORT_METADATA_ENTRY))
+                zipOutputStream.write(
+                    JSONObject()
+                        .put("incremental", true)
+                        .put("since_ms", sinceMs)
+                        .put("until_ms", untilMs)
+                        .toString().toByteArray()
+                )
+                zipOutputStream.closeEntry()
+            }
             val jsonZipEntry = ZipEntry("messages.ndjson")
             zipOutputStream.putNextEntry(jsonZipEntry)
             if (prefs.getBoolean("sms", true)) {
                 totals.sms = smsToJSON(
-                    appContext, zipOutputStream, displayNames, updateProgress
+                    appContext, zipOutputStream, displayNames, updateProgress, dateRangeMs
                 )
             }
             // synchronizedList because the partitioned MMS cursor workers append to it
@@ -174,6 +193,7 @@ suspend fun exportMessages(
                     displayNames,
                     mmsPartList,
                     updateProgress,
+                    dateRangeMs,
                 )
             }
             zipOutputStream.closeEntry()
@@ -256,11 +276,12 @@ private suspend fun smsToJSON(
     zipOutputStream: ZipOutputStream,
     displayNames: MutableMap<String, String?>,
     updateProgress: suspend (Progress) -> Unit,
+    dateRangeMs: Pair<Long, Long>? = null,
 ): Int {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     val maxRecords = prefs.getString("max_records", "")?.toIntOrNull() ?: -1
     var progress = Progress(0, 0, null)
-    val selection = messageSelection(appContext, SMS)
+    val selection = messageSelection(appContext, SMS, dateRangeMs)
     // Collect the matching row IDs up front so that cursor iteration can be split
     // into contiguous _id ranges, one per worker.
     val messageIds = mutableListOf<Long>()
@@ -333,13 +354,14 @@ private suspend fun mmsToJSON(
     displayNames: MutableMap<String, String?>,
     mmsPartList: MutableList<MmsBinaryPart>,
     updateProgress: suspend (Progress) -> Unit,
+    dateRangeMs: Pair<Long, Long>? = null,
 ): Int {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     val includeBlobs = prefs.getBoolean("include_blobs", true)
     val includeBinaryData = prefs.getBoolean("include_binary_data", true)
     val maxRecords = prefs.getString("max_records", "")?.toIntOrNull() ?: -1
     var progress = Progress(0, 0, null)
-    val selection = messageSelection(appContext, MMS)
+    val selection = messageSelection(appContext, MMS, dateRangeMs)
     // Fetch all MMS parts in a single query and group them by message ID, rather
     // than issuing one provider query per exported message.
     val partsByMessageId = ConcurrentHashMap<String, JSONArray>()
@@ -516,7 +538,7 @@ suspend fun importMessages(
 ): MessageTotal {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
     var progress = Progress(0, 0, null)
-    val deduplication = prefs.getBoolean("deduplication", false)
+    var deduplication = prefs.getBoolean("deduplication", false)
     val importSubIds = prefs.getBoolean("import_sub_ids", false)
     val importSms = prefs.getBoolean("sms", true)
     val importMms = prefs.getBoolean("mms", true)
@@ -860,6 +882,18 @@ suspend fun importMessages(
         ZipInputStream(inputStream).use { zipInputStream ->
             var zipEntry = zipInputStream.nextEntry
             while (zipEntry != null) {
+                // Delta archives mark themselves so overlap re-exports cannot
+                // duplicate rows on restore, regardless of the dedup pref.
+                if (zipEntry.name == EXPORT_METADATA_ENTRY) {
+                    try {
+                        if (JSONObject(
+                                zipInputStream.readBytes().decodeToString()
+                            ).optBoolean("incremental")
+                        ) deduplication = true
+                    } catch (e: Exception) {
+                        Log.w(LOG_TAG, "Ignoring malformed $EXPORT_METADATA_ENTRY", e)
+                    }
+                }
                 if (zipEntry.name == "messages.ndjson") break
                 zipEntry = zipInputStream.nextEntry
             }

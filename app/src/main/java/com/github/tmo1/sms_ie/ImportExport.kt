@@ -207,12 +207,32 @@ suspend fun automaticExport(
 
     if (prefs.getBoolean("export_messages", true)) {
         try {
+            // In incremental mode each scheduled export covers only messages
+            // newer than the previous successful one. The watermark is the
+            // run's start time minus an overlap window, and it advances only
+            // after the archive has been written completely, so a failed run
+            // never skips a range. The overlap exists because the provider
+            // 'date' column can carry a stale sender-side timestamp (notably
+            // MMS, which stores send-time in seconds): a message committed
+            // after the previous run but stamped before its end would
+            // otherwise fall below the watermark permanently. Messages whose
+            // stamps are older than the overlap are still missed - recovering
+            // those requires a full export.
+            val incremental = prefs.getBoolean("incremental_export", false)
+            val runStart = System.currentTimeMillis()
+            val dateRangeMs = if (incremental) Pair(
+                prefs.getLong("incremental_watermark_ms", 0L), runStart
+            ) else null
             val file = createFile(
                 documentTree, "application/zip", "messages$dateInString.zip", passphrase != null
             )
             messages = exportMessages(
-                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress
+                appContext, getOutputStream(appContext, file.uri, passphrase), updateProgress,
+                dateRangeMs
             )
+            if (incremental) prefs.edit().putLong(
+                "incremental_watermark_ms", runStart - INCREMENTAL_OVERLAP_MS
+            ).apply()
             deleteOldExports(prefs, documentTree, file, "messages")
         } catch (e: Exception) {
             firstException = e
@@ -324,6 +344,10 @@ val FORMAT_VERSION = byteArrayOf(0x00, 0x01)
 // These are the values of the "SECOND RECOMMENDED option" of RFC 9106, for situations where
 // "much less memory is available."
 // https://datatracker.ietf.org/doc/html/rfc9106#name-parameter-choice
+
+// How far behind each run's start the incremental watermark trails, so a
+// message committed late but stamped early is still picked up by a later run.
+const val INCREMENTAL_OVERLAP_MS = 24L * 60 * 60 * 1000
 
 const val T_COST_IN_ITERATIONS = 3
 const val M_COST_IN_KIBIBYTES = 65536

@@ -225,9 +225,11 @@ private fun getMessageFilters(prefs: SharedPreferences, list: ArrayList<MessageF
 }
 
 @OptIn(ExperimentalTime::class)
-fun messageSelection(appContext: Context, messageType: Int): String? {
+fun messageSelection(
+    appContext: Context, messageType: Int, dateRangeMs: Pair<Long, Long>? = null
+): String? {
     val prefs = PreferenceManager.getDefaultSharedPreferences(appContext)
-    val selection = if (prefs.getBoolean("message_filtering", false)) {
+    val filterSelection = if (prefs.getBoolean("message_filtering", false)) {
         val list = arrayListOf<MessageFilter>()
         getMessageFilters(prefs, list)
         list.filter {
@@ -266,6 +268,27 @@ fun messageSelection(appContext: Context, messageType: Int): String? {
             "${it.column.substringAfter('.')} ${it.operator} $value"
         }
     } else null
+    // Incremental scheduled exports pass a date range so that each run covers
+    // only new messages. The 'date' column holds milliseconds for SMS and
+    // seconds for MMS. The SMS lower bound is exclusive: the stored watermark
+    // was already covered by the previous run. The MMS lower bound stays
+    // inclusive after flooring to seconds because messages sharing that
+    // boundary second cannot be distinguished; a boundary-second MMS is
+    // re-exported, which the optional import deduplication absorbs. The
+    // upper bound rounds up so an MMS arriving in the partial final second
+    // is not skipped while the watermark advances past it.
+    val clauses = mutableListOf<String>()
+    if (filterSelection != null) clauses.add(filterSelection)
+    dateRangeMs?.let { (sinceMs, untilMs) ->
+        if (messageType == MMS) {
+            clauses.add("date >= ${sinceMs / 1000}")
+            clauses.add("date <= ${(untilMs + 999) / 1000}")
+        } else {
+            clauses.add("date > $sinceMs")
+            clauses.add("date <= $untilMs")
+        }
+    }
+    val selection = clauses.joinToString(" AND ").takeIf { it.isNotEmpty() }
     Log.d(LOG_TAG, "${if (messageType == SMS) "SMS" else "MMS"} selection: $selection")
     return selection
 }
